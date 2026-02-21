@@ -21,7 +21,11 @@ enum PacketType {
     PACKET_INPUT = 3,
     PACKET_GAME_STATE = 4,
     PACKET_PLAYER_JOINED = 5,
-    PACKET_PLAYER_LEFT = 6
+    PACKET_PLAYER_LEFT = 6,
+    PACKET_CREATE_LOBBY = 7,
+    PACKET_JOIN_LOBBY = 8,
+    PACKET_LOBBY_UPDATE = 9,
+    PACKET_START_GAME = 10
 };
 
 struct Vec2 {
@@ -66,10 +70,24 @@ struct WeaponPickup {
     bool active;
 };
 
+struct LobbyPlayer {
+    char name[32];
+    IPaddress address;
+    bool ready;
+    bool isHost;
+};
+
+struct Lobby {
+    char code[5];
+    std::vector<LobbyPlayer> players;
+    bool inGame;
+};
+
 // Game state
 std::map<int, Player> players; // playerIndex -> Player
 std::vector<Bullet> bullets;
 std::vector<WeaponPickup> weapons;
+std::map<std::string, Lobby> lobbies; // lobbyCode -> Lobby
 UDPsocket serverSocket;
 UDPpacket* inPacket;
 UDPpacket* outPacket;
@@ -179,6 +197,138 @@ void handleDisconnect(int playerIndex) {
             outPacket->address = pair.second.address;
             SDLNet_UDP_Send(serverSocket, -1, outPacket);
         }
+    }
+}
+
+void broadcastLobbyUpdate(const std::string& lobbyCode) {
+    if (lobbies.find(lobbyCode) == lobbies.end()) return;
+    
+    Lobby& lobby = lobbies[lobbyCode];
+    
+    outPacket->data[0] = PACKET_LOBBY_UPDATE;
+    outPacket->data[1] = lobby.players.size();
+    
+    int offset = 2;
+    for (const auto& player : lobby.players) {
+        memcpy(outPacket->data + offset, player.name, 32);
+        offset += 32;
+        outPacket->data[offset++] = player.isHost ? 1 : 0;
+        outPacket->data[offset++] = player.ready ? 1 : 0;
+    }
+    
+    outPacket->len = offset;
+    
+    // Send to all players in lobby
+    for (const auto& player : lobby.players) {
+        outPacket->address = player.address;
+        SDLNet_UDP_Send(serverSocket, -1, outPacket);
+    }
+    
+    std::cout << "Broadcasted lobby update for " << lobbyCode << " (" << lobby.players.size() << " players)" << std::endl;
+}
+
+void handleCreateLobby(IPaddress addr, const char* lobbyCode, const char* playerName) {
+    std::string code(lobbyCode, 4);
+    
+    // Check if lobby already exists
+    if (lobbies.find(code) != lobbies.end()) {
+        std::cout << "Lobby " << code << " already exists" << std::endl;
+        return;
+    }
+    
+    // Create new lobby
+    Lobby newLobby;
+    strncpy(newLobby.code, lobbyCode, 4);
+    newLobby.code[4] = '\0';
+    newLobby.inGame = false;
+    
+    // Add host player
+    LobbyPlayer host;
+    strncpy(host.name, playerName, 31);
+    host.name[31] = '\0';
+    host.address = addr;
+    host.ready = true;
+    host.isHost = true;
+    newLobby.players.push_back(host);
+    
+    lobbies[code] = newLobby;
+    
+    std::cout << "Created lobby " << code << " by " << playerName << std::endl;
+    
+    // Send lobby update to host
+    broadcastLobbyUpdate(code);
+}
+
+void handleJoinLobby(IPaddress addr, const char* lobbyCode, const char* playerName) {
+    std::string code(lobbyCode, 4);
+    
+    // Check if lobby exists
+    if (lobbies.find(code) == lobbies.end()) {
+        std::cout << "Lobby " << code << " not found" << std::endl;
+        return;
+    }
+    
+    Lobby& lobby = lobbies[code];
+    
+    // Check if lobby is full
+    if (lobby.players.size() >= 4) {
+        std::cout << "Lobby " << code << " is full" << std::endl;
+        return;
+    }
+    
+    // Check if player already in lobby
+    for (const auto& player : lobby.players) {
+        if (player.address.host == addr.host && player.address.port == addr.port) {
+            std::cout << "Player already in lobby " << code << std::endl;
+            return;
+        }
+    }
+    
+    // Add player to lobby
+    LobbyPlayer newPlayer;
+    strncpy(newPlayer.name, playerName, 31);
+    newPlayer.name[31] = '\0';
+    newPlayer.address = addr;
+    newPlayer.ready = true;
+    newPlayer.isHost = false;
+    lobby.players.push_back(newPlayer);
+    
+    std::cout << playerName << " joined lobby " << code << std::endl;
+    
+    // Broadcast update to all players in lobby
+    broadcastLobbyUpdate(code);
+}
+
+void handleStartGame(const char* lobbyCode) {
+    std::string code(lobbyCode, 4);
+    
+    // Check if lobby exists
+    if (lobbies.find(code) == lobbies.end()) {
+        std::cout << "Lobby " << code << " not found for start game" << std::endl;
+        return;
+    }
+    
+    Lobby& lobby = lobbies[code];
+    
+    // Check if enough players
+    if (lobby.players.size() < 2) {
+        std::cout << "Not enough players in lobby " << code << std::endl;
+        return;
+    }
+    
+    // Mark lobby as in game
+    lobby.inGame = true;
+    
+    std::cout << "Starting game for lobby " << code << " with " << lobby.players.size() << " players" << std::endl;
+    
+    // Send start game packet to all players
+    outPacket->data[0] = PACKET_START_GAME;
+    memcpy(outPacket->data + 1, lobbyCode, 4);
+    outPacket->len = 5;
+    
+    for (const auto& player : lobby.players) {
+        outPacket->address = player.address;
+        SDLNet_UDP_Send(serverSocket, -1, outPacket);
     }
 }
 
@@ -423,6 +573,36 @@ int main(int argc, char* argv[]) {
                         
                         handlePlayerInput(playerIndex, input);
                     }
+                    break;
+                }
+                
+                case PACKET_CREATE_LOBBY: {
+                    char lobbyCode[5];
+                    char playerName[32];
+                    memcpy(lobbyCode, inPacket->data + 1, 4);
+                    lobbyCode[4] = '\0';
+                    memcpy(playerName, inPacket->data + 5, 32);
+                    playerName[31] = '\0';
+                    handleCreateLobby(inPacket->address, lobbyCode, playerName);
+                    break;
+                }
+                
+                case PACKET_JOIN_LOBBY: {
+                    char lobbyCode[5];
+                    char playerName[32];
+                    memcpy(lobbyCode, inPacket->data + 1, 4);
+                    lobbyCode[4] = '\0';
+                    memcpy(playerName, inPacket->data + 5, 32);
+                    playerName[31] = '\0';
+                    handleJoinLobby(inPacket->address, lobbyCode, playerName);
+                    break;
+                }
+                
+                case PACKET_START_GAME: {
+                    char lobbyCode[5];
+                    memcpy(lobbyCode, inPacket->data + 1, 4);
+                    lobbyCode[4] = '\0';
+                    handleStartGame(lobbyCode);
                     break;
                 }
                 
