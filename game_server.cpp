@@ -264,7 +264,14 @@ void handleJoinLobby(IPaddress addr, const char* lobbyCode, const char* playerNa
     
     // Check if lobby exists
     if (lobbies.find(code) == lobbies.end()) {
-        std::cout << "Lobby " << code << " not found" << std::endl;
+        std::cout << "Lobby " << code << " not found - sending error" << std::endl;
+        
+        // Send error packet back to client
+        outPacket->data[0] = PACKET_LOBBY_UPDATE;
+        outPacket->data[1] = 0; // 0 players = lobby not found
+        outPacket->len = 2;
+        outPacket->address = addr;
+        SDLNet_UDP_Send(serverSocket, -1, outPacket);
         return;
     }
     
@@ -273,6 +280,13 @@ void handleJoinLobby(IPaddress addr, const char* lobbyCode, const char* playerNa
     // Check if lobby is full
     if (lobby.players.size() >= 4) {
         std::cout << "Lobby " << code << " is full" << std::endl;
+        
+        // Send error packet
+        outPacket->data[0] = PACKET_LOBBY_UPDATE;
+        outPacket->data[1] = 0;
+        outPacket->len = 2;
+        outPacket->address = addr;
+        SDLNet_UDP_Send(serverSocket, -1, outPacket);
         return;
     }
     
@@ -280,6 +294,8 @@ void handleJoinLobby(IPaddress addr, const char* lobbyCode, const char* playerNa
     for (const auto& player : lobby.players) {
         if (player.address.host == addr.host && player.address.port == addr.port) {
             std::cout << "Player already in lobby " << code << std::endl;
+            // Just send the current lobby state
+            broadcastLobbyUpdate(code);
             return;
         }
     }
